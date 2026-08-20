@@ -103,7 +103,7 @@ Controls SteelSeries GG Sonar's Streamer Mode layout.
 
 ```powershell
 # 1. Install Macro Deck CLI
-dotnet tool install -g MacroDeck.Plugin.Cli
+dotnet tool install -g MacroDeck.Plugin.Cli --prerelease
 
 # 2. Build Release
 dotnet build -c Release

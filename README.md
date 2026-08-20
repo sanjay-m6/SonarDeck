@@ -112,7 +112,7 @@ To compile and package the plugin locally:
 
 Install the Macro Deck CLI tool:
 ```powershell
-dotnet tool install -g MacroDeck.Plugin.Cli
+dotnet tool install -g MacroDeck.Plugin.Cli --prerelease
 ```
 
 ### 2. Build the Project

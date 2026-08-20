@@ -39,7 +39,7 @@ jobs:
         run: dotnet build SteelSeriesSonarPlugin/SteelSeriesSonarPlugin.csproj -c Release --no-restore
 
       - name: Install Macro Deck Plugin CLI
-        run: dotnet tool install -g MacroDeck.Plugin.Cli
+        run: dotnet tool install -g MacroDeck.Plugin.Cli --add-source https://api.nuget.org/v3/index.json --prerelease
 
       - name: Validate Plugin Output
         run: macrodeck-plugin validate --directory SteelSeriesSonarPlugin/bin/Release/net10.0

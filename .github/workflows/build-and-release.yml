@@ -16,6 +16,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE20: true
+
 jobs:
   build-and-package:
     name: Build & Package Macro Deck Plugin
@@ -33,10 +36,10 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Restore Dependencies
-        run: dotnet restore SteelSeriesSonarPlugin/SteelSeriesSonarPlugin.csproj
+        run: dotnet restore SonarDeck.slnx
 
       - name: Build Release
-        run: dotnet build SteelSeriesSonarPlugin/SteelSeriesSonarPlugin.csproj -c Release --no-restore
+        run: dotnet build SonarDeck.slnx -c Release --no-restore
 
       - name: Install Macro Deck Plugin CLI
         run: dotnet tool install -g MacroDeck.Plugin.Cli --add-source https://api.nuget.org/v3/index.json --prerelease

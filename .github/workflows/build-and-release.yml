@@ -52,6 +52,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist
           macrodeck-plugin pack --source SteelSeriesSonarPlugin/bin/Release/net10.0 --output dist/com.steelseries.sonar.macroDeckPlugin --force
+          macrodeck-plugin pack --source SteelSeriesSonarPlugin/bin/Release/net10.0 --output dist/com.steelseries.sonar-1.1.0.macroDeckPlugin --force
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4

@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace SteelSeriesSonarPlugin;
 
@@ -22,10 +24,41 @@ public static class SonarChannel
         Master, Game, ChatRender, ChatCapture, Media, Aux, Microphone
     ];
 
-    public static string Normalize(string channel) =>
-        channel.Equals("microphone", StringComparison.OrdinalIgnoreCase)
-            ? ChatCapture
-            : channel;
+    public static string Normalize(string? channel)
+    {
+        if (string.IsNullOrWhiteSpace(channel))
+            return Master;
+
+        var lower = channel.Trim().ToLowerInvariant();
+        return lower switch
+        {
+            "master" => Master,
+            "game" => Game,
+            "chat" or "chatrender" or "chat_render" or "chat (output)" or "chat(output)" => ChatRender,
+            "mic" or "microphone" or "chatcapture" or "chat_capture" or "chat (input)" or "chat(input)" => ChatCapture,
+            "media" => Media,
+            "aux" => Aux,
+            _ => channel
+        };
+    }
+
+    public static string[] GetAliases(string? channel)
+    {
+        var norm = Normalize(channel);
+        if (string.Equals(norm, ChatRender, StringComparison.OrdinalIgnoreCase))
+            return [ChatRender, "chat", "Chat", "chatRender", "ChatRender"];
+        if (string.Equals(norm, ChatCapture, StringComparison.OrdinalIgnoreCase))
+            return [ChatCapture, "chatCapture", "ChatCapture", "microphone", "Microphone", "mic", "Mic"];
+        if (string.Equals(norm, Master, StringComparison.OrdinalIgnoreCase))
+            return [Master, "master", "Master"];
+        if (string.Equals(norm, Game, StringComparison.OrdinalIgnoreCase))
+            return [Game, "game", "Game"];
+        if (string.Equals(norm, Media, StringComparison.OrdinalIgnoreCase))
+            return [Media, "media", "Media"];
+        if (string.Equals(norm, Aux, StringComparison.OrdinalIgnoreCase))
+            return [Aux, "aux", "Aux"];
+        return [norm, channel ?? ""];
+    }
 }
 
 /// <summary>
@@ -79,30 +112,18 @@ public sealed class SonarClient
 
     private readonly HttpClient _http;
     private string? _sonarBase; // e.g. "http://127.0.0.1:54241"
+    private string? _cachedClassicJson;
+    private DateTimeOffset _cachedClassicExpires = DateTimeOffset.MinValue;
+    private readonly SemaphoreSlim _classicLock = new(1, 1);
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         PropertyNameCaseInsensitive = true,
     };
 
-    public SonarClient()
-        : this(CreateDefaultHttpClient())
-    {
-    }
-
     public SonarClient(HttpClient http)
     {
         _http = http ?? throw new ArgumentNullException(nameof(http));
-    }
-
-    private static HttpClient CreateDefaultHttpClient()
-    {
-        var handler = new HttpClientHandler
-        {
-            // SteelSeries GG uses self-signed certificates for localhost IPC
-            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
-        };
-        return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(5) };
     }
 
     // ── Address discovery ─────────────────────────────────────────────────────
@@ -118,9 +139,11 @@ public sealed class SonarClient
             return _sonarBase;
 
         if (!File.Exists(CorePropsPath))
+        {
             throw new InvalidOperationException(
                 $"SteelSeries GG does not appear to be installed or has never been launched. " +
                 $"Expected coreProps.json at: {CorePropsPath}");
+        }
 
         var raw = await File.ReadAllTextAsync(CorePropsPath, ct);
         var coreProps = JsonSerializer.Deserialize<CoreProps>(raw, JsonOpts)
@@ -142,9 +165,11 @@ public sealed class SonarClient
             ?? throw new InvalidOperationException("Failed to parse /subApps response from GG.");
 
         if (!subApps.SubApps.TryGetValue("sonar", out var sonar))
+        {
             throw new InvalidOperationException(
                 "SteelSeries GG is running but Sonar is not available. " +
                 "Please ensure the Sonar feature is enabled in GG.");
+        }
 
         var sonarAddress = sonar.Metadata.WebServerAddress;
         if (string.IsNullOrWhiteSpace(sonarAddress))
@@ -164,7 +189,43 @@ public sealed class SonarClient
     }
 
     /// <summary>Clears the cached Sonar address so it is re-discovered next call.</summary>
-    public void ResetCache() => _sonarBase = null;
+    public void ResetCache()
+    {
+        _sonarBase = null;
+        _cachedClassicJson = null;
+        _cachedClassicExpires = DateTimeOffset.MinValue;
+    }
+
+    private async Task<string> GetVolumeSettingsJsonAsync(OutputType output, CancellationToken ct)
+    {
+        var sonarBase = await GetSonarBaseAsync(ct);
+        if (output is OutputType.Streaming or OutputType.Monitoring)
+        {
+            var url = $"{sonarBase}/volumeSettings/streamer";
+            return await _http.GetStringAsync(url, ct);
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (_cachedClassicJson is not null && now < _cachedClassicExpires)
+            return _cachedClassicJson;
+
+        await _classicLock.WaitAsync(ct);
+        try
+        {
+            now = DateTimeOffset.UtcNow;
+            if (_cachedClassicJson is not null && now < _cachedClassicExpires)
+                return _cachedClassicJson;
+
+            var url = $"{sonarBase}/volumeSettings/classic";
+            _cachedClassicJson = await _http.GetStringAsync(url, ct);
+            _cachedClassicExpires = DateTimeOffset.UtcNow.AddMilliseconds(200);
+            return _cachedClassicJson;
+        }
+        finally
+        {
+            _classicLock.Release();
+        }
+    }
 
     // ── Volume ────────────────────────────────────────────────────────────────
 
@@ -173,55 +234,11 @@ public sealed class SonarClient
         string channel, OutputType output = OutputType.None, CancellationToken ct = default)
     {
         channel = SonarChannel.Normalize(channel);
-        var sonarBase = await GetSonarBaseAsync(ct);
+        var json = await GetVolumeSettingsJsonAsync(output, ct);
 
-        if (output is OutputType.Streaming or OutputType.Monitoring)
-        {
-            var url = $"{sonarBase}/volumeSettings/streamer";
-            var json = await _http.GetStringAsync(url, ct);
-            using var doc = JsonDocument.Parse(json);
-            var streamType = output == OutputType.Streaming ? "streaming" : "monitoring";
-
-            if (channel.Equals(SonarChannel.Master, StringComparison.OrdinalIgnoreCase))
-            {
-                return doc.RootElement
-                    .GetProperty("masters")
-                    .GetProperty("stream")
-                    .GetProperty(streamType)
-                    .GetProperty("volume")
-                    .GetDouble();
-            }
-
-            return doc.RootElement
-                .GetProperty("devices")
-                .GetProperty(channel)
-                .GetProperty("stream")
-                .GetProperty(streamType)
-                .GetProperty("volume")
-                .GetDouble();
-        }
-        else
-        {
-            var url = $"{sonarBase}/volumeSettings/classic";
-            var json = await _http.GetStringAsync(url, ct);
-            using var doc = JsonDocument.Parse(json);
-
-            if (channel.Equals(SonarChannel.Master, StringComparison.OrdinalIgnoreCase))
-            {
-                return doc.RootElement
-                    .GetProperty("masters")
-                    .GetProperty("classic")
-                    .GetProperty("volume")
-                    .GetDouble();
-            }
-
-            return doc.RootElement
-                .GetProperty("devices")
-                .GetProperty(channel)
-                .GetProperty("classic")
-                .GetProperty("volume")
-                .GetDouble();
-        }
+        var streamType = output == OutputType.Streaming ? "streaming" : "monitoring";
+        return ExtractChannelNumber(json, channel, streamType, "volume", "Volume")
+            ?? throw LogAndBuildParseError(json, channel, "volume");
     }
 
     /// <summary>Sets the volume (0.0–1.0) for the given channel.</summary>
@@ -229,9 +246,10 @@ public sealed class SonarClient
         string channel, double volume,
         OutputType output = OutputType.None, CancellationToken ct = default)
     {
+        _cachedClassicExpires = DateTimeOffset.MinValue;
         channel = SonarChannel.Normalize(channel);
         volume = Math.Clamp(volume, 0.0, 1.0);
-        var volStr = volume.ToString("0.##", CultureInfo.InvariantCulture);
+        var volStr = volume.ToString("0.####", CultureInfo.InvariantCulture);
         var sonarBase = await GetSonarBaseAsync(ct);
 
         string url;
@@ -249,9 +267,7 @@ public sealed class SonarClient
                 : $"{sonarBase}/volumeSettings/classic/{channel}/Volume/{volStr}";
         }
 
-        using var req = new HttpRequestMessage(HttpMethod.Put, url);
-        using var resp = await _http.SendAsync(req, ct);
-        resp.EnsureSuccessStatusCode();
+        await PutEmptyAsync(url, ct);
     }
 
     // ── Mute ──────────────────────────────────────────────────────────────────
@@ -261,55 +277,11 @@ public sealed class SonarClient
         string channel, OutputType output = OutputType.None, CancellationToken ct = default)
     {
         channel = SonarChannel.Normalize(channel);
-        var sonarBase = await GetSonarBaseAsync(ct);
+        var json = await GetVolumeSettingsJsonAsync(output, ct);
 
-        if (output is OutputType.Streaming or OutputType.Monitoring)
-        {
-            var url = $"{sonarBase}/volumeSettings/streamer";
-            var json = await _http.GetStringAsync(url, ct);
-            using var doc = JsonDocument.Parse(json);
-            var streamType = output == OutputType.Streaming ? "streaming" : "monitoring";
-
-            if (channel.Equals(SonarChannel.Master, StringComparison.OrdinalIgnoreCase))
-            {
-                return doc.RootElement
-                    .GetProperty("masters")
-                    .GetProperty("stream")
-                    .GetProperty(streamType)
-                    .GetProperty("muted")
-                    .GetBoolean();
-            }
-
-            return doc.RootElement
-                .GetProperty("devices")
-                .GetProperty(channel)
-                .GetProperty("stream")
-                .GetProperty(streamType)
-                .GetProperty("muted")
-                .GetBoolean();
-        }
-        else
-        {
-            var url = $"{sonarBase}/volumeSettings/classic";
-            var json = await _http.GetStringAsync(url, ct);
-            using var doc = JsonDocument.Parse(json);
-
-            if (channel.Equals(SonarChannel.Master, StringComparison.OrdinalIgnoreCase))
-            {
-                return doc.RootElement
-                    .GetProperty("masters")
-                    .GetProperty("classic")
-                    .GetProperty("muted")
-                    .GetBoolean();
-            }
-
-            return doc.RootElement
-                .GetProperty("devices")
-                .GetProperty(channel)
-                .GetProperty("classic")
-                .GetProperty("muted")
-                .GetBoolean();
-        }
+        var streamType = output == OutputType.Streaming ? "streaming" : "monitoring";
+        return ExtractChannelBool(json, channel, streamType, "muted", "Mute", "isMuted")
+            ?? throw LogAndBuildParseError(json, channel, "mute");
     }
 
     /// <summary>Sets the mute state for the given channel.</summary>
@@ -336,9 +308,7 @@ public sealed class SonarClient
                 : $"{sonarBase}/volumeSettings/classic/{channel}/Mute/{muteStr}";
         }
 
-        using var req = new HttpRequestMessage(HttpMethod.Put, url);
-        using var resp = await _http.SendAsync(req, ct);
-        resp.EnsureSuccessStatusCode();
+        await PutEmptyAsync(url, ct);
     }
 
     /// <summary>Toggles the mute state for the given channel and returns the new state.</summary>
@@ -359,24 +329,57 @@ public sealed class SonarClient
     public async Task SetChatMixAsync(double chatMix, CancellationToken ct = default)
     {
         chatMix = Math.Clamp(chatMix, -1.0, 1.0);
-        // Balance game vs chat volume proportionally
-        var gameVol = chatMix >= 0 ? 1.0 : (1.0 + chatMix);
-        var chatVol = chatMix <= 0 ? 1.0 : (1.0 - chatMix);
+        var chatMixStr = chatMix.ToString("0.##", CultureInfo.InvariantCulture);
 
-        await SetVolumeAsync(SonarChannel.Game, gameVol, OutputType.None, ct);
-        await SetVolumeAsync(SonarChannel.ChatRender, chatVol, OutputType.None, ct);
+        try
+        {
+            var sonarBase = await GetSonarBaseAsync(ct);
+            var url = $"{sonarBase}/chatMix?balance={chatMixStr}";
+            await PutEmptyAsync(url, ct);
+        }
+        catch
+        {
+            // Fallback for Sonar versions that require proportional Game & Chat volumes
+            var gameVol = chatMix >= 0 ? 1.0 : (1.0 + chatMix);
+            var chatVol = chatMix <= 0 ? 1.0 : (1.0 - chatMix);
+
+            await SetVolumeAsync(SonarChannel.Game, gameVol, OutputType.None, ct);
+            await SetVolumeAsync(SonarChannel.ChatRender, chatVol, OutputType.None, ct);
+        }
     }
 
-    /// <summary>Returns an approximate chat-mix value based on Game and Chat levels.</summary>
+    /// <summary>Returns an approximate chat-mix value (−1.0 to +1.0).</summary>
     public async Task<double> GetChatMixAsync(CancellationToken ct = default)
     {
+        try
+        {
+            var sonarBase = await GetSonarBaseAsync(ct);
+            var url = $"{sonarBase}/chatMix";
+            var json = await _http.GetStringAsync(url, ct);
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            if (root.ValueKind == JsonValueKind.Number)
+                return root.GetDouble();
+
+            foreach (var name in new[] { "chatMix", "balance", "value" })
+            {
+                if (root.TryGetProperty(name, out var prop) && prop.ValueKind == JsonValueKind.Number)
+                    return prop.GetDouble();
+            }
+        }
+        catch
+        {
+            // Fallback: estimate from Game vs Chat volume
+        }
+
         var gameVol = await GetVolumeAsync(SonarChannel.Game, OutputType.None, ct);
         var chatVol = await GetVolumeAsync(SonarChannel.ChatRender, OutputType.None, ct);
 
         if (gameVol < 0.99)
-            return gameVol - 1.0; // Negative (more chat)
+            return gameVol - 1.0;
         if (chatVol < 0.99)
-            return 1.0 - chatVol; // Positive (more game)
+            return 1.0 - chatVol;
         return 0.0;
     }
 
@@ -400,9 +403,7 @@ public sealed class SonarClient
         var sonarBase = await GetSonarBaseAsync(ct);
         var modeName = enabled ? "stream" : "classic";
         var url = $"{sonarBase}/mode/{modeName}";
-        using var req = new HttpRequestMessage(HttpMethod.Put, url);
-        using var resp = await _http.SendAsync(req, ct);
-        resp.EnsureSuccessStatusCode();
+        await PutEmptyAsync(url, ct);
     }
 
     /// <summary>Toggles Streamer Mode and returns the new state.</summary>
@@ -433,5 +434,153 @@ public sealed class SonarClient
             ResetCache();
             return false;
         }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static string BuildVolumeSettingsUrl(string sonarBase, OutputType output) =>
+        output is OutputType.Streaming or OutputType.Monitoring
+            ? $"{sonarBase}/volumeSettings/streamer"
+            : $"{sonarBase}/volumeSettings/classic";
+
+    private async Task PutEmptyAsync(string url, CancellationToken ct)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Put, url);
+        using var resp = await _http.SendAsync(req, ct);
+        resp.EnsureSuccessStatusCode();
+    }
+
+    private static double? ExtractChannelNumber(string json, string channel, string streamType, params string[] propertyNames)
+    {
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        var aliases = SonarChannel.GetAliases(channel);
+
+        foreach (var chName in aliases)
+        {
+            // Try direct hierarchical lookup first
+            if (chName.Equals(SonarChannel.Master, StringComparison.OrdinalIgnoreCase))
+            {
+                if (root.TryGetProperty("masters", out var masters))
+                {
+                    if (masters.TryGetProperty("classic", out var classic) && classic.TryGetProperty("volume", out var v))
+                        return v.GetDouble();
+                    if (masters.TryGetProperty("stream", out var stream) &&
+                        stream.TryGetProperty(streamType, out var st) &&
+                        st.TryGetProperty("volume", out var sv))
+                        return sv.GetDouble();
+                }
+            }
+            else
+            {
+                if (root.TryGetProperty("devices", out var devices) && devices.TryGetProperty(chName, out var ch))
+                {
+                    if (ch.TryGetProperty("classic", out var classic) && classic.TryGetProperty("volume", out var v))
+                        return v.GetDouble();
+                    if (ch.TryGetProperty("stream", out var stream) &&
+                        stream.TryGetProperty(streamType, out var st) &&
+                        st.TryGetProperty("volume", out var sv))
+                        return sv.GetDouble();
+                }
+            }
+
+            // Fallback: search tree
+            if (TryFindChannelObject(root, chName, out var channelElement))
+            {
+                foreach (var name in propertyNames)
+                {
+                    if (channelElement.TryGetProperty(name, out var prop) && prop.ValueKind == JsonValueKind.Number)
+                        return prop.GetDouble();
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool? ExtractChannelBool(string json, string channel, string streamType, params string[] propertyNames)
+    {
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        var aliases = SonarChannel.GetAliases(channel);
+
+        foreach (var chName in aliases)
+        {
+            // Try direct hierarchical lookup first
+            if (chName.Equals(SonarChannel.Master, StringComparison.OrdinalIgnoreCase))
+            {
+                if (root.TryGetProperty("masters", out var masters))
+                {
+                    if (masters.TryGetProperty("classic", out var classic) && classic.TryGetProperty("muted", out var m))
+                        return m.GetBoolean();
+                    if (masters.TryGetProperty("stream", out var stream) &&
+                        stream.TryGetProperty(streamType, out var st) &&
+                        st.TryGetProperty("muted", out var sm))
+                        return sm.GetBoolean();
+                }
+            }
+            else
+            {
+                if (root.TryGetProperty("devices", out var devices) && devices.TryGetProperty(chName, out var ch))
+                {
+                    if (ch.TryGetProperty("classic", out var classic) && classic.TryGetProperty("muted", out var m))
+                        return m.GetBoolean();
+                    if (ch.TryGetProperty("stream", out var stream) &&
+                        stream.TryGetProperty(streamType, out var st) &&
+                        st.TryGetProperty("muted", out var sm))
+                        return sm.GetBoolean();
+                }
+            }
+
+            // Fallback: search tree
+            if (TryFindChannelObject(root, chName, out var channelElement))
+            {
+                foreach (var name in propertyNames)
+                {
+                    if (channelElement.TryGetProperty(name, out var prop) &&
+                        (prop.ValueKind == JsonValueKind.True || prop.ValueKind == JsonValueKind.False))
+                        return prop.GetBoolean();
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryFindChannelObject(JsonElement element, string channel, out JsonElement found)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var prop in element.EnumerateObject())
+            {
+                if (string.Equals(prop.Name, channel, StringComparison.OrdinalIgnoreCase) &&
+                    prop.Value.ValueKind == JsonValueKind.Object)
+                {
+                    found = prop.Value;
+                    return true;
+                }
+                if (TryFindChannelObject(prop.Value, channel, out found))
+                    return true;
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                if (TryFindChannelObject(item, channel, out found))
+                    return true;
+            }
+        }
+
+        found = default;
+        return false;
+    }
+
+    private static InvalidOperationException LogAndBuildParseError(string json, string channel, string field)
+    {
+        return new InvalidOperationException(
+            $"Could not parse '{field}' for channel '{channel}' from Sonar response.");
     }
 }

@@ -4,8 +4,8 @@ using Microsoft.Extensions.Logging;
 namespace SteelSeriesSonarPlugin.Actions;
 
 /// <summary>
-/// Nudges a Sonar channel's volume up or down by a configurable step.
-/// Supports Classic mode and Streamer Mode (Streaming / Monitoring outputs).
+/// Nudges a Sonar channel's volume up or down by a configurable step. Supports Classic mode
+/// and Streamer Mode (Streaming / Monitoring outputs).
 /// </summary>
 public sealed class AdjustVolumeAction : IActionDefinition
 {
@@ -16,20 +16,35 @@ public sealed class AdjustVolumeAction : IActionDefinition
     public string Name => "Adjust Volume";
     public string Description => "Increase or decrease a Sonar channel's volume by a step.";
 
-    public IReadOnlyList<ActionParameter> Parameters { get; }
+    public IReadOnlyList<ActionParameter> Parameters { get; } =
+    [
+        SonarActionParameters.Channel(defaultValue: SonarChannel.Game),
+        SonarActionParameters.OutputTypeParameter(),
+        ActionParameter.Choice(
+            name: "direction",
+            options:
+            [
+                new ActionParameterOption { Value = "increase", Label = "Increase" },
+                new ActionParameterOption { Value = "decrease", Label = "Decrease" },
+            ],
+            label: "Direction",
+            description: "Increase or decrease the volume.",
+            defaultValue: "increase",
+            required: true),
+        ActionParameter.Slider(
+            name: "step",
+            min: 1,
+            max: 25,
+            label: "Step (%)",
+            description: "How much to change the volume by (1-25 %).",
+            step: 1,
+            defaultValue: 5),
+    ];
 
     public AdjustVolumeAction(SonarClient sonar, ILogger logger)
     {
         _sonar = sonar;
         _logger = logger;
-
-        Parameters =
-        [
-            ActionParameter.Choice("channel", SonarChoices.Channels, "Channel", "Audio channel to adjust", defaultValue: "game", required: true),
-            ActionParameter.Choice("outputType", SonarChoices.OutputTypes, "Output Type", "Classic = single slider; Streaming / Monitoring = Streamer Mode", defaultValue: "Classic", required: true),
-            ActionParameter.Choice("direction", SonarChoices.Directions, "Direction", "Increase (+) or Decrease (-) volume", defaultValue: "Increase", required: true),
-            ActionParameter.Number("step", "Step (%)", "Volume change per trigger (1–25%)", min: 1, max: 25, step: 1, defaultValue: 5, required: true)
-        ];
     }
 
     public IActionExecutor CreateExecutor() => new Executor(_sonar, _logger);
@@ -47,23 +62,14 @@ public sealed class AdjustVolumeAction : IActionDefinition
 
         public async Task<ActionResult> ExecuteAsync(ActionExecutionContext context)
         {
-            var channel = context.Parameters.GetString("channel") ?? "game";
-            var outputRaw = context.Parameters.GetString("outputType") ?? "Classic";
-            var direction = context.Parameters.GetString("direction") ?? "Increase";
-            var stepPercent = context.Parameters.GetInt32("step") ?? 5;
+            var channel = SonarActionParameters.ReadChannel(context.Parameters, fallback: SonarChannel.Game);
+            var output = SonarActionParameters.ReadOutputType(context.Parameters);
+            var direction = SonarActionParameters.ReadString(context.Parameters, "direction", "increase");
+            var decrease = direction.Equals("decrease", StringComparison.OrdinalIgnoreCase);
+            var stepPercent = SonarActionParameters.ReadDouble(context.Parameters, "step", 5.0);
+            var step = decrease ? -(stepPercent / 100.0) : stepPercent / 100.0;
 
-            var output = outputRaw switch
-            {
-                "Streaming" => OutputType.Streaming,
-                "Monitoring" => OutputType.Monitoring,
-                _ => OutputType.None
-            };
-
-            var step = stepPercent / 100.0;
-            if (direction == "Decrease")
-            {
-                step = -step;
-            }
+            _logger.LogInformation("AdjustVolume: channel={Channel} output={Output} step={Step:+0.##;-0.##}", channel, output, step);
 
             try
             {

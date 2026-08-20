@@ -15,17 +15,26 @@ public sealed class SetStreamerModeAction : IActionDefinition
     public string Name => "Set Streamer Mode";
     public string Description => "Enable, disable, or toggle Sonar Streamer Mode (dual Streaming/Monitoring sliders).";
 
-    public IReadOnlyList<ActionParameter> Parameters { get; }
+    public IReadOnlyList<ActionParameter> Parameters { get; } =
+    [
+        ActionParameter.Choice(
+            name: "action",
+            options:
+            [
+                new ActionParameterOption { Value = "enable", Label = "Enable" },
+                new ActionParameterOption { Value = "disable", Label = "Disable" },
+                new ActionParameterOption { Value = "toggle", Label = "Toggle" },
+            ],
+            label: "Action",
+            description: "Enable / Disable Streamer Mode, or Toggle (flip) the current state.",
+            defaultValue: "toggle",
+            required: true),
+    ];
 
     public SetStreamerModeAction(SonarClient sonar, ILogger logger)
     {
         _sonar = sonar;
         _logger = logger;
-
-        Parameters =
-        [
-            ActionParameter.Choice("action", SonarChoices.StreamerModeActions, "Action", "Enable / Disable Streamer Mode, or Toggle state", defaultValue: "Toggle", required: true)
-        ];
     }
 
     public IActionExecutor CreateExecutor() => new Executor(_sonar, _logger);
@@ -43,15 +52,16 @@ public sealed class SetStreamerModeAction : IActionDefinition
 
         public async Task<ActionResult> ExecuteAsync(ActionExecutionContext context)
         {
-            var action = context.Parameters.GetString("action") ?? "Toggle";
+            var action = SonarActionParameters.ReadString(context.Parameters, "action", "toggle").ToLowerInvariant();
+
             _logger.LogInformation("SetStreamerMode: action={Action}", action);
 
             try
             {
-                bool newState = action switch
+                var newState = action switch
                 {
-                    "Enable" => await EnableAsync(context.CancellationToken),
-                    "Disable" => await DisableAsync(context.CancellationToken),
+                    "enable" => await EnableAsync(context.CancellationToken),
+                    "disable" => await DisableAsync(context.CancellationToken),
                     _ => await _sonar.ToggleStreamerModeAsync(context.CancellationToken)
                 };
 

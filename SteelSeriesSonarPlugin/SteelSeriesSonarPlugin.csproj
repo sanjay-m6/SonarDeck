@@ -8,6 +8,7 @@
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <AssemblyName>SteelSeriesSonarPlugin</AssemblyName>
     <RootNamespace>SteelSeriesSonarPlugin</RootNamespace>
+    <Version>1.1.0</Version>
     <AnalysisLevel>latest</AnalysisLevel>
     <UseAppHost>false</UseAppHost>
     <!-- Copy manifest + assets into build output so the plugin host can find them -->
@@ -31,6 +32,9 @@
   <!-- Embed manifest.json into the output directory -->
   <ItemGroup>
     <None Update="manifest.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="icon.svg">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Update="Assets\icon.svg">

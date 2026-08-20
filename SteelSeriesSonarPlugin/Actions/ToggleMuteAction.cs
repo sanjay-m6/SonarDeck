@@ -15,18 +15,16 @@ public sealed class ToggleMuteAction : IActionDefinition
     public string Name => "Toggle Mute";
     public string Description => "Flip the mute state of a Sonar channel.";
 
-    public IReadOnlyList<ActionParameter> Parameters { get; }
+    public IReadOnlyList<ActionParameter> Parameters { get; } =
+    [
+        SonarActionParameters.Channel(),
+        SonarActionParameters.OutputTypeParameter(),
+    ];
 
     public ToggleMuteAction(SonarClient sonar, ILogger logger)
     {
         _sonar = sonar;
         _logger = logger;
-
-        Parameters =
-        [
-            ActionParameter.Choice("channel", SonarChoices.Channels, "Channel", "Audio channel to toggle mute for", defaultValue: "master", required: true),
-            ActionParameter.Choice("outputType", SonarChoices.OutputTypes, "Output Type", "Classic = single slider; Streaming / Monitoring = Streamer Mode", defaultValue: "Classic", required: true)
-        ];
     }
 
     public IActionExecutor CreateExecutor() => new Executor(_sonar, _logger);
@@ -44,21 +42,15 @@ public sealed class ToggleMuteAction : IActionDefinition
 
         public async Task<ActionResult> ExecuteAsync(ActionExecutionContext context)
         {
-            var channel = context.Parameters.GetString("channel") ?? "master";
-            var outputRaw = context.Parameters.GetString("outputType") ?? "Classic";
+            var channel = SonarActionParameters.ReadChannel(context.Parameters);
+            var output = SonarActionParameters.ReadOutputType(context.Parameters);
 
-            var output = outputRaw switch
-            {
-                "Streaming" => OutputType.Streaming,
-                "Monitoring" => OutputType.Monitoring,
-                _ => OutputType.None
-            };
+            _logger.LogInformation("ToggleMute: channel={Channel} output={Output}", channel, output);
 
             try
             {
-                var isMuted = await _sonar.ToggleMuteAsync(channel, output, context.CancellationToken);
-                _logger.LogInformation("ToggleMute: channel={Channel} output={Output} isMuted={IsMuted}",
-                    channel, output, isMuted);
+                var newState = await _sonar.ToggleMuteAsync(channel, output, context.CancellationToken);
+                _logger.LogInformation("Channel {Channel} is now {State}", channel, newState ? "muted" : "unmuted");
                 return ActionResult.Success();
             }
             catch (Exception ex)

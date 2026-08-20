@@ -15,19 +15,27 @@ public sealed class MuteAction : IActionDefinition
     public string Name => "Mute / Unmute";
     public string Description => "Set the mute state of a Sonar channel to On or Off.";
 
-    public IReadOnlyList<ActionParameter> Parameters { get; }
+    public IReadOnlyList<ActionParameter> Parameters { get; } =
+    [
+        SonarActionParameters.Channel(),
+        SonarActionParameters.OutputTypeParameter(),
+        ActionParameter.Choice(
+            name: "muteState",
+            options:
+            [
+                new ActionParameterOption { Value = "mute", Label = "Mute" },
+                new ActionParameterOption { Value = "unmute", Label = "Unmute" },
+            ],
+            label: "State",
+            description: "Mute or unmute the channel.",
+            defaultValue: "mute",
+            required: true),
+    ];
 
     public MuteAction(SonarClient sonar, ILogger logger)
     {
         _sonar = sonar;
         _logger = logger;
-
-        Parameters =
-        [
-            ActionParameter.Choice("channel", SonarChoices.Channels, "Channel", "Audio channel to mute/unmute", defaultValue: "master", required: true),
-            ActionParameter.Choice("outputType", SonarChoices.OutputTypes, "Output Type", "Classic = single slider; Streaming / Monitoring = Streamer Mode", defaultValue: "Classic", required: true),
-            ActionParameter.Choice("state", SonarChoices.MuteStates, "State", "Mute (Off) or Unmute (On)", defaultValue: "Mute", required: true)
-        ];
     }
 
     public IActionExecutor CreateExecutor() => new Executor(_sonar, _logger);
@@ -45,18 +53,12 @@ public sealed class MuteAction : IActionDefinition
 
         public async Task<ActionResult> ExecuteAsync(ActionExecutionContext context)
         {
-            var channel = context.Parameters.GetString("channel") ?? "master";
-            var outputRaw = context.Parameters.GetString("outputType") ?? "Classic";
-            var state = context.Parameters.GetString("state") ?? "Mute";
+            var channel = SonarActionParameters.ReadChannel(context.Parameters);
+            var output = SonarActionParameters.ReadOutputType(context.Parameters);
+            var state = SonarActionParameters.ReadString(context.Parameters, "muteState", "mute");
+            var mute = state.Equals("mute", StringComparison.OrdinalIgnoreCase);
 
-            var output = outputRaw switch
-            {
-                "Streaming" => OutputType.Streaming,
-                "Monitoring" => OutputType.Monitoring,
-                _ => OutputType.None
-            };
-
-            var mute = state == "Mute";
+            _logger.LogInformation("Mute: channel={Channel} output={Output} mute={Mute}", channel, output, mute);
 
             try
             {
@@ -65,7 +67,7 @@ public sealed class MuteAction : IActionDefinition
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to set mute state on channel {Channel}", channel);
+                _logger.LogError(ex, "Failed to set mute on channel {Channel}", channel);
                 _sonar.ResetCache();
                 return ActionResult.Failed("execution_failed", ex.Message);
             }

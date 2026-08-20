@@ -1,0 +1,67 @@
+name: Build and Package Plugin
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-package:
+    name: Build & Package Macro Deck Plugin
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore Dependencies
+        run: dotnet restore SteelSeriesSonarPlugin/SteelSeriesSonarPlugin.csproj
+
+      - name: Build Release
+        run: dotnet build SteelSeriesSonarPlugin/SteelSeriesSonarPlugin.csproj -c Release --no-restore
+
+      - name: Install Macro Deck Plugin CLI
+        run: dotnet tool install -g MacroDeck.Plugin.Cli
+
+      - name: Validate Plugin Output
+        run: macrodeck-plugin validate --directory SteelSeriesSonarPlugin/bin/Release/net10.0
+
+      - name: Pack .macroDeckPlugin Artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          macrodeck-plugin pack --source SteelSeriesSonarPlugin/bin/Release/net10.0 --output dist/com.steelseries.sonar.macroDeckPlugin --force
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: com.steelseries.sonar-plugin
+          path: dist/*.macroDeckPlugin
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.macroDeckPlugin
+          generate_release_notes: true
+          draft: false
+          prerelease: false

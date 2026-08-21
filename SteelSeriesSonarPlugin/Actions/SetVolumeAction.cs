@@ -48,7 +48,9 @@ public sealed class SetVolumeAction : IActionDefinition, ISliderActionDefinition
         try
         {
             var current = await _sonar.GetVolumeAsync(channel, output, cancellationToken);
-            return new SliderActionState(Min: 0, Max: 100, Step: 1, Value: Math.Round(current * 100.0));
+            var percent = Math.Round(current * 100.0);
+            _logger.LogDebug("[Sonar] Slider read: {Channel} = {Value}%", channel, percent);
+            return new SliderActionState(Min: 0, Max: 100, Step: 1, Value: percent);
         }
         catch (Exception ex)
         {

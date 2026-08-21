@@ -63,11 +63,11 @@ public static class SonarChannel
 
 /// <summary>
 /// In streamer mode each channel has two independent sliders.
-/// Use <c>None</c> (default) when streamer mode is off / classic.
+/// Use <c>None</c> (default) to automatically target the active mode.
 /// </summary>
 public enum OutputType
 {
-    /// <summary>Classic (single-slider) mode.</summary>
+    /// <summary>Auto (Classic mode if classic, Monitoring if streamer mode).</summary>
     None,
     /// <summary>The mix sent to the streaming encoder (OBS, etc.).</summary>
     Streaming,
@@ -112,9 +112,17 @@ public sealed class SonarClient
 
     private readonly HttpClient _http;
     private string? _sonarBase; // e.g. "http://127.0.0.1:54241"
+
+    private string? _cachedMode;
+    private DateTimeOffset _cachedModeExpires = DateTimeOffset.MinValue;
+
     private string? _cachedClassicJson;
     private DateTimeOffset _cachedClassicExpires = DateTimeOffset.MinValue;
     private readonly SemaphoreSlim _classicLock = new(1, 1);
+
+    private string? _cachedStreamerJson;
+    private DateTimeOffset _cachedStreamerExpires = DateTimeOffset.MinValue;
+    private readonly SemaphoreSlim _streamerLock = new(1, 1);
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -188,42 +196,72 @@ public sealed class SonarClient
         return _sonarBase;
     }
 
-    /// <summary>Clears the cached Sonar address so it is re-discovered next call.</summary>
+    /// <summary>Clears the cached Sonar address and state so it is re-discovered next call.</summary>
     public void ResetCache()
     {
         _sonarBase = null;
+        _cachedMode = null;
+        _cachedModeExpires = DateTimeOffset.MinValue;
         _cachedClassicJson = null;
         _cachedClassicExpires = DateTimeOffset.MinValue;
+        _cachedStreamerJson = null;
+        _cachedStreamerExpires = DateTimeOffset.MinValue;
     }
 
     private async Task<string> GetVolumeSettingsJsonAsync(OutputType output, CancellationToken ct)
     {
-        var sonarBase = await GetSonarBaseAsync(ct);
-        if (output is OutputType.Streaming or OutputType.Monitoring)
+        var isStreamer = output is OutputType.Streaming or OutputType.Monitoring;
+        if (!isStreamer && output == OutputType.None)
         {
-            var url = $"{sonarBase}/volumeSettings/streamer";
-            return await _http.GetStringAsync(url, ct);
+            isStreamer = await GetStreamerModeAsync(ct);
         }
 
+        var sonarBase = await GetSonarBaseAsync(ct);
         var now = DateTimeOffset.UtcNow;
-        if (_cachedClassicJson is not null && now < _cachedClassicExpires)
-            return _cachedClassicJson;
 
-        await _classicLock.WaitAsync(ct);
-        try
+        if (isStreamer)
         {
-            now = DateTimeOffset.UtcNow;
+            if (_cachedStreamerJson is not null && now < _cachedStreamerExpires)
+                return _cachedStreamerJson;
+
+            await _streamerLock.WaitAsync(ct);
+            try
+            {
+                now = DateTimeOffset.UtcNow;
+                if (_cachedStreamerJson is not null && now < _cachedStreamerExpires)
+                    return _cachedStreamerJson;
+
+                var url = $"{sonarBase}/volumeSettings/streamer";
+                _cachedStreamerJson = await _http.GetStringAsync(url, ct);
+                _cachedStreamerExpires = DateTimeOffset.UtcNow.AddMilliseconds(500);
+                return _cachedStreamerJson;
+            }
+            finally
+            {
+                _streamerLock.Release();
+            }
+        }
+        else
+        {
             if (_cachedClassicJson is not null && now < _cachedClassicExpires)
                 return _cachedClassicJson;
 
-            var url = $"{sonarBase}/volumeSettings/classic";
-            _cachedClassicJson = await _http.GetStringAsync(url, ct);
-            _cachedClassicExpires = DateTimeOffset.UtcNow.AddMilliseconds(200);
-            return _cachedClassicJson;
-        }
-        finally
-        {
-            _classicLock.Release();
+            await _classicLock.WaitAsync(ct);
+            try
+            {
+                now = DateTimeOffset.UtcNow;
+                if (_cachedClassicJson is not null && now < _cachedClassicExpires)
+                    return _cachedClassicJson;
+
+                var url = $"{sonarBase}/volumeSettings/classic";
+                _cachedClassicJson = await _http.GetStringAsync(url, ct);
+                _cachedClassicExpires = DateTimeOffset.UtcNow.AddMilliseconds(500);
+                return _cachedClassicJson;
+            }
+            finally
+            {
+                _classicLock.Release();
+            }
         }
     }
 
@@ -247,11 +285,37 @@ public sealed class SonarClient
         OutputType output = OutputType.None, CancellationToken ct = default)
     {
         _cachedClassicExpires = DateTimeOffset.MinValue;
+        _cachedStreamerExpires = DateTimeOffset.MinValue;
         channel = SonarChannel.Normalize(channel);
         volume = Math.Clamp(volume, 0.0, 1.0);
         var volStr = volume.ToString("0.####", CultureInfo.InvariantCulture);
         var sonarBase = await GetSonarBaseAsync(ct);
 
+        var isStreamerMode = await GetStreamerModeAsync(ct);
+
+        var effectiveOutput = output;
+        if (effectiveOutput == OutputType.None && isStreamerMode)
+        {
+            effectiveOutput = OutputType.Monitoring;
+        }
+
+        try
+        {
+            await SendSetVolumeRequestAsync(sonarBase, channel, volStr, effectiveOutput, ct);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.InternalServerError)
+        {
+            // Invalidate mode cache and retry with the opposite mode if Sonar rejected current mode
+            _cachedModeExpires = DateTimeOffset.MinValue;
+            var freshStreamerMode = await GetStreamerModeAsync(ct);
+            var fallbackOutput = freshStreamerMode ? OutputType.Monitoring : OutputType.None;
+            await SendSetVolumeRequestAsync(sonarBase, channel, volStr, fallbackOutput, ct);
+        }
+    }
+
+    private async Task SendSetVolumeRequestAsync(
+        string sonarBase, string channel, string volStr, OutputType output, CancellationToken ct)
+    {
         string url;
         if (output is OutputType.Streaming or OutputType.Monitoring)
         {
@@ -289,10 +353,36 @@ public sealed class SonarClient
         string channel, bool mute,
         OutputType output = OutputType.None, CancellationToken ct = default)
     {
+        _cachedClassicExpires = DateTimeOffset.MinValue;
+        _cachedStreamerExpires = DateTimeOffset.MinValue;
         channel = SonarChannel.Normalize(channel);
         var muteStr = mute ? "true" : "false";
         var sonarBase = await GetSonarBaseAsync(ct);
 
+        var isStreamerMode = await GetStreamerModeAsync(ct);
+
+        var effectiveOutput = output;
+        if (effectiveOutput == OutputType.None && isStreamerMode)
+        {
+            effectiveOutput = OutputType.Monitoring;
+        }
+
+        try
+        {
+            await SendSetMuteRequestAsync(sonarBase, channel, muteStr, effectiveOutput, ct);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.InternalServerError)
+        {
+            _cachedModeExpires = DateTimeOffset.MinValue;
+            var freshStreamerMode = await GetStreamerModeAsync(ct);
+            var fallbackOutput = freshStreamerMode ? OutputType.Monitoring : OutputType.None;
+            await SendSetMuteRequestAsync(sonarBase, channel, muteStr, fallbackOutput, ct);
+        }
+    }
+
+    private async Task SendSetMuteRequestAsync(
+        string sonarBase, string channel, string muteStr, OutputType output, CancellationToken ct)
+    {
         string url;
         if (output is OutputType.Streaming or OutputType.Monitoring)
         {
@@ -318,6 +408,33 @@ public sealed class SonarClient
         var current = await GetMuteAsync(channel, output, ct);
         await SetMuteAsync(channel, !current, output, ct);
         return !current;
+    }
+
+    // ── Batch state read ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Reads the active volume-settings JSON once and returns volume (0.0–1.0)
+    /// and muted state for every channel. Used by the variable provider to service
+    /// all 13 variables from a single cached API call instead of 13 individual ones.
+    /// </summary>
+    public async Task<Dictionary<string, (double Volume, bool Muted)>> GetAllActiveStatesAsync(
+        CancellationToken ct = default)
+    {
+        var json = await GetVolumeSettingsJsonAsync(OutputType.None, ct);
+        var result = new Dictionary<string, (double Volume, bool Muted)>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var channel in SonarChannel.All)
+        {
+            var vol = ExtractChannelNumber(json, channel, "monitoring", "volume", "Volume");
+            var muted = ExtractChannelBool(json, channel, "monitoring", "muted", "Mute", "isMuted");
+
+            if (vol.HasValue)
+            {
+                result[channel] = (vol.Value, muted ?? false);
+            }
+        }
+
+        return result;
     }
 
     // ── Chat Mix ──────────────────────────────────────────────────────────────
@@ -388,10 +505,23 @@ public sealed class SonarClient
     /// <summary>Returns whether Streamer Mode is currently active.</summary>
     public async Task<bool> GetStreamerModeAsync(CancellationToken ct = default)
     {
-        var sonarBase = await GetSonarBaseAsync(ct);
-        var url = $"{sonarBase}/mode";
-        var raw = await _http.GetStringAsync(url, ct);
-        return raw.Trim('"', ' ', '\r', '\n').Equals("stream", StringComparison.OrdinalIgnoreCase);
+        var now = DateTimeOffset.UtcNow;
+        if (_cachedMode is not null && now < _cachedModeExpires)
+            return _cachedMode.Equals("stream", StringComparison.OrdinalIgnoreCase);
+
+        try
+        {
+            var sonarBase = await GetSonarBaseAsync(ct);
+            var url = $"{sonarBase}/mode";
+            var raw = await _http.GetStringAsync(url, ct);
+            _cachedMode = raw.Trim('"', ' ', '\r', '\n');
+            _cachedModeExpires = DateTimeOffset.UtcNow.AddMilliseconds(1000);
+            return _cachedMode.Equals("stream", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -404,6 +534,10 @@ public sealed class SonarClient
         var modeName = enabled ? "stream" : "classic";
         var url = $"{sonarBase}/mode/{modeName}";
         await PutEmptyAsync(url, ct);
+        _cachedMode = modeName;
+        _cachedModeExpires = DateTimeOffset.UtcNow.AddMilliseconds(1000);
+        _cachedClassicExpires = DateTimeOffset.MinValue;
+        _cachedStreamerExpires = DateTimeOffset.MinValue;
     }
 
     /// <summary>Toggles Streamer Mode and returns the new state.</summary>
@@ -425,7 +559,7 @@ public sealed class SonarClient
         try
         {
             var sonarBase = await GetSonarBaseAsync(ct);
-            var url = $"{sonarBase}/volumeSettings/classic";
+            var url = $"{sonarBase}/mode";
             using var resp = await _http.GetAsync(url, ct);
             return resp.IsSuccessStatusCode;
         }
@@ -438,16 +572,18 @@ public sealed class SonarClient
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static string BuildVolumeSettingsUrl(string sonarBase, OutputType output) =>
-        output is OutputType.Streaming or OutputType.Monitoring
-            ? $"{sonarBase}/volumeSettings/streamer"
-            : $"{sonarBase}/volumeSettings/classic";
-
     private async Task PutEmptyAsync(string url, CancellationToken ct)
     {
         using var req = new HttpRequestMessage(HttpMethod.Put, url);
         using var resp = await _http.SendAsync(req, ct);
-        resp.EnsureSuccessStatusCode();
+        if (!resp.IsSuccessStatusCode)
+        {
+            var errorBody = await resp.Content.ReadAsStringAsync(ct);
+            throw new HttpRequestException(
+                $"Sonar API request to {url} failed with status {resp.StatusCode}: {errorBody}",
+                null,
+                resp.StatusCode);
+        }
     }
 
     private static double? ExtractChannelNumber(string json, string channel, string streamType, params string[] propertyNames)
@@ -464,24 +600,40 @@ public sealed class SonarClient
             {
                 if (root.TryGetProperty("masters", out var masters))
                 {
-                    if (masters.TryGetProperty("classic", out var classic) && classic.TryGetProperty("volume", out var v))
-                        return v.GetDouble();
+                    // If stream property is present and populated, prefer it for streamer mode
                     if (masters.TryGetProperty("stream", out var stream) &&
                         stream.TryGetProperty(streamType, out var st) &&
-                        st.TryGetProperty("volume", out var sv))
-                        return sv.GetDouble();
+                        st.TryGetProperty("volume", out var sv) &&
+                        sv.TryGetDouble(out var d1) &&
+                        double.IsFinite(d1))
+                        return d1;
+
+                    // Fallback to classic
+                    if (masters.TryGetProperty("classic", out var classic) &&
+                        classic.TryGetProperty("volume", out var v) &&
+                        v.TryGetDouble(out var d2) &&
+                        double.IsFinite(d2))
+                        return d2;
                 }
             }
             else
             {
                 if (root.TryGetProperty("devices", out var devices) && devices.TryGetProperty(chName, out var ch))
                 {
-                    if (ch.TryGetProperty("classic", out var classic) && classic.TryGetProperty("volume", out var v))
-                        return v.GetDouble();
+                    // If stream property is present and populated, prefer it for streamer mode
                     if (ch.TryGetProperty("stream", out var stream) &&
                         stream.TryGetProperty(streamType, out var st) &&
-                        st.TryGetProperty("volume", out var sv))
-                        return sv.GetDouble();
+                        st.TryGetProperty("volume", out var sv) &&
+                        sv.TryGetDouble(out var d1) &&
+                        double.IsFinite(d1))
+                        return d1;
+
+                    // Fallback to classic
+                    if (ch.TryGetProperty("classic", out var classic) &&
+                        classic.TryGetProperty("volume", out var v) &&
+                        v.TryGetDouble(out var d2) &&
+                        double.IsFinite(d2))
+                        return d2;
                 }
             }
 
@@ -490,8 +642,15 @@ public sealed class SonarClient
             {
                 foreach (var name in propertyNames)
                 {
-                    if (channelElement.TryGetProperty(name, out var prop) && prop.ValueKind == JsonValueKind.Number)
-                        return prop.GetDouble();
+                    if (channelElement.TryGetProperty(name, out var prop))
+                    {
+                        if (prop.ValueKind == JsonValueKind.Number && prop.TryGetDouble(out var d) && double.IsFinite(d))
+                            return d;
+                        if (prop.ValueKind == JsonValueKind.String &&
+                            double.TryParse(prop.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var sd) &&
+                            double.IsFinite(sd))
+                            return sd;
+                    }
                 }
             }
         }
@@ -513,24 +672,32 @@ public sealed class SonarClient
             {
                 if (root.TryGetProperty("masters", out var masters))
                 {
-                    if (masters.TryGetProperty("classic", out var classic) && classic.TryGetProperty("muted", out var m))
-                        return m.GetBoolean();
                     if (masters.TryGetProperty("stream", out var stream) &&
                         stream.TryGetProperty(streamType, out var st) &&
-                        st.TryGetProperty("muted", out var sm))
+                        st.TryGetProperty("muted", out var sm) &&
+                        (sm.ValueKind is JsonValueKind.True or JsonValueKind.False))
                         return sm.GetBoolean();
+
+                    if (masters.TryGetProperty("classic", out var classic) &&
+                        classic.TryGetProperty("muted", out var m) &&
+                        (m.ValueKind is JsonValueKind.True or JsonValueKind.False))
+                        return m.GetBoolean();
                 }
             }
             else
             {
                 if (root.TryGetProperty("devices", out var devices) && devices.TryGetProperty(chName, out var ch))
                 {
-                    if (ch.TryGetProperty("classic", out var classic) && classic.TryGetProperty("muted", out var m))
-                        return m.GetBoolean();
                     if (ch.TryGetProperty("stream", out var stream) &&
                         stream.TryGetProperty(streamType, out var st) &&
-                        st.TryGetProperty("muted", out var sm))
+                        st.TryGetProperty("muted", out var sm) &&
+                        (sm.ValueKind is JsonValueKind.True or JsonValueKind.False))
                         return sm.GetBoolean();
+
+                    if (ch.TryGetProperty("classic", out var classic) &&
+                        classic.TryGetProperty("muted", out var m) &&
+                        (m.ValueKind is JsonValueKind.True or JsonValueKind.False))
+                        return m.GetBoolean();
                 }
             }
 
@@ -539,9 +706,14 @@ public sealed class SonarClient
             {
                 foreach (var name in propertyNames)
                 {
-                    if (channelElement.TryGetProperty(name, out var prop) &&
-                        (prop.ValueKind == JsonValueKind.True || prop.ValueKind == JsonValueKind.False))
-                        return prop.GetBoolean();
+                    if (channelElement.TryGetProperty(name, out var prop))
+                    {
+                        if (prop.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                            return prop.GetBoolean();
+                        if (prop.ValueKind == JsonValueKind.String &&
+                            bool.TryParse(prop.GetString(), out var sb))
+                            return sb;
+                    }
                 }
             }
         }
